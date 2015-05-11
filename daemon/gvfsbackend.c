@@ -622,32 +622,15 @@ g_vfs_backend_invocation_first_handler (GVfsDBusMount *object,
   return FALSE;
 }
 
-
-typedef struct {
-  GVfsBackend *backend;
-  GAsyncReadyCallback callback;
-  gpointer callback_data;
-} AsyncProxyCreate;
-
-static void
-async_proxy_create_free (AsyncProxyCreate *data)
-{
-  g_clear_object (&data->backend);
-  g_free (data);
-}
-
 static void
 create_mount_tracker_proxy (GVfsBackend *backend,
                             GAsyncReadyCallback op_callback,
                             gpointer op_callback_data,
                             GAsyncReadyCallback callback)
 {
-  AsyncProxyCreate *data;
+  GTask *task;
 
-  data = g_new0 (AsyncProxyCreate, 1);
-  data->callback = op_callback;
-  data->callback_data = op_callback_data;
-  data->backend = g_object_ref (backend);
+  task = g_task_new (backend, NULL, op_callback, op_callback_data);
 
   gvfs_dbus_mount_tracker_proxy_new_for_bus (G_BUS_TYPE_SESSION,
                                              G_DBUS_PROXY_FLAGS_DO_NOT_CONNECT_SIGNALS | G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES,
@@ -655,7 +638,28 @@ create_mount_tracker_proxy (GVfsBackend *backend,
                                              G_VFS_DBUS_MOUNTTRACKER_PATH,
                                              NULL,
                                              callback,
-                                             data);
+                                             task);
+}
+
+static void
+register_mount_cb (GVfsDBusMountTracker *proxy,
+                   GAsyncResult *res,
+                   gpointer user_data)
+{
+  GTask *task = G_TASK (user_data);
+  GError *error = NULL;
+
+  if (!gvfs_dbus_mount_tracker_call_register_mount_finish (proxy, res, &error))
+    {
+      g_dbus_error_strip_remote_error (error);
+      g_task_return_error (task, error);
+    }
+  else
+    {
+      g_task_return_boolean (task, TRUE);
+    }
+
+  g_object_unref (task);
 }
 
 static void
@@ -663,10 +667,9 @@ register_mount_got_proxy_cb (GObject *source_object,
                              GAsyncResult *res,
                              gpointer user_data)
 {
-  AsyncProxyCreate *data = user_data;
+  GTask *task = G_TASK (user_data);
   GVfsDBusMountTracker *proxy;
   GError *error = NULL;
-  GSimpleAsyncResult *result;
   GVfsBackend *backend;
   char *stable_name;
   char *x_content_types_string;
@@ -677,16 +680,12 @@ register_mount_got_proxy_cb (GObject *source_object,
   if (proxy == NULL)
     {
       g_dbus_error_strip_remote_error (error);
-      result = g_simple_async_result_new_take_error (source_object,
-                                                     data->callback, data->callback_data,
-                                                     error);
-      g_simple_async_result_complete_in_idle (result);
-      g_object_unref (result);
-      async_proxy_create_free (data);
+      g_task_return_error (task, error);
+      g_object_unref (task);
       return;
     }
 
-  backend = data->backend;
+  backend = G_VFS_BACKEND (g_task_get_source_object (task));
   backend->priv->is_mounted = TRUE;
 
   if (backend->priv->x_content_types != NULL && g_strv_length (backend->priv->x_content_types) > 0)
@@ -718,14 +717,13 @@ register_mount_got_proxy_cb (GObject *source_object,
                                                g_mount_spec_to_dbus (backend->priv->mount_spec),
                                                backend->priv->default_location ? backend->priv->default_location : "",
                                                NULL,
-                                               data->callback, data->callback_data);
+                                               (GAsyncReadyCallback)register_mount_cb, task);
 
   g_free (stable_name);
   g_free (x_content_types_string);
   g_free (icon_str);
   g_free (symbolic_icon_str);
   g_object_unref (proxy);
-  async_proxy_create_free (data);
 }
 
 void
@@ -736,39 +734,64 @@ g_vfs_backend_register_mount (GVfsBackend *backend,
   create_mount_tracker_proxy (backend, callback, user_data, register_mount_got_proxy_cb);
 }
 
+gboolean
+g_vfs_backend_register_mount_finish (GVfsBackend *backend,
+                                     GAsyncResult *res,
+                                     GError **error)
+{
+  g_return_val_if_fail (g_task_is_valid (res, backend), FALSE);
+
+  return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+static void
+unregister_mount_cb (GVfsDBusMountTracker *proxy,
+                     GAsyncResult *res,
+                     gpointer user_data)
+{
+  GTask *task = G_TASK (user_data);
+  GError *error = NULL;
+
+  if (!gvfs_dbus_mount_tracker_call_unregister_mount_finish (proxy, res, &error))
+    {
+      g_dbus_error_strip_remote_error (error);
+      g_task_return_error (task, error);
+    }
+  else
+    {
+      g_task_return_boolean (task, TRUE);
+    }
+
+  g_object_unref (task);
+}
+
 static void
 unregister_mount_got_proxy_cb (GObject *source_object,
                                GAsyncResult *res,
                                gpointer user_data)
 {
-  AsyncProxyCreate *data = user_data;
+  GTask *task = G_TASK (user_data);
   GVfsDBusMountTracker *proxy;
   GError *error = NULL;
-  GSimpleAsyncResult *result;
   GVfsBackend *backend;
 
   proxy = gvfs_dbus_mount_tracker_proxy_new_for_bus_finish (res, &error);
   if (proxy == NULL)
     {
       g_dbus_error_strip_remote_error (error);
-      result = g_simple_async_result_new_take_error (source_object,
-                                                     data->callback, data->callback_data,
-                                                     error);
-      g_simple_async_result_complete_in_idle (result);
-      g_object_unref (result);
-      async_proxy_create_free (data);
+      g_task_return_error (task, error);
+      g_object_unref (task);
       return;
     }
 
-  backend = data->backend;
+  backend = G_VFS_BACKEND (g_task_get_source_object (task));
   
   gvfs_dbus_mount_tracker_call_unregister_mount (proxy,
                                                  backend->priv->object_path,
                                                  NULL,
-                                                 data->callback, data->callback_data);
+                                                 (GAsyncReadyCallback)unregister_mount_cb, task);
 
   g_object_unref (proxy);
-  async_proxy_create_free (data);
 }
 
 void
@@ -779,11 +802,20 @@ g_vfs_backend_unregister_mount (GVfsBackend *backend,
   create_mount_tracker_proxy (backend, callback, user_data, unregister_mount_got_proxy_cb);
 }
 
+gboolean
+g_vfs_backend_unregister_mount_finish (GVfsBackend *backend,
+                                       GAsyncResult *res,
+                                       GError **error)
+{
+  g_return_val_if_fail (g_task_is_valid (res, backend), FALSE);
+
+  return g_task_propagate_boolean (G_TASK (res), error);
+}
+
 /* ------------------------------------------------------------------------------------------------- */
 
 typedef struct
 {
-  GVfsBackend *backend;
   GMountSource *mount_source;
 
   gboolean ret;
@@ -795,52 +827,36 @@ typedef struct
 
   gboolean completed;
 
-  GAsyncReadyCallback callback;
-  gpointer            user_data;
-
   guint timeout_id;
 } UnmountWithOpData;
 
 static void
-complete_unmount_with_op (UnmountWithOpData *data, gboolean no_more_processes)
+complete_unmount_with_op (GTask *task, gboolean no_more_processes)
 {
-  gboolean ret;
-  GSimpleAsyncResult *simple;
+  UnmountWithOpData *data;
+
+  data = g_task_get_task_data (task);
 
   g_source_remove (data->timeout_id);
 
-  ret = TRUE;
-
-  simple = g_simple_async_result_new (G_OBJECT (data->backend),
-                                      data->callback,
-                                      data->user_data,
-                                      NULL);
-
-  if (no_more_processes)
-    {
-      /* do nothing, e.g. return TRUE to signal we should unmount */
-    }
-  else if (!data->ret)
+  if (!no_more_processes && !data->ret)
     {
       /*  If the "show-processes" signal wasn't handled */
-      g_simple_async_result_set_error (simple, G_IO_ERROR, G_IO_ERROR_BUSY,
-                                       _("File system is busy"));
-      ret = FALSE;
+      g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_BUSY,
+                               _("File system is busy"));
+    }
+  else if (!no_more_processes && (data->aborted || data->choice == 1))
+    {
+      g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED_HANDLED,
+                               "GMountOperation aborted");
     }
   else
     {
-      if (data->aborted || data->choice == 1)
-        {
-          g_simple_async_result_set_error (simple, G_IO_ERROR, G_IO_ERROR_FAILED_HANDLED,
-                                           "GMountOperation aborted");
-          ret = FALSE;
-        }
+      g_task_return_boolean (task, TRUE);
     }
 
   data->completed = TRUE;
-  g_simple_async_result_set_op_res_gboolean (simple, ret);
-  g_simple_async_result_complete (simple);
-  g_object_unref (simple);
+  g_object_unref (task);
 }
 
 static void
@@ -848,7 +864,10 @@ on_show_processes_reply (GMountSource  *mount_source,
                          GAsyncResult  *res,
                          gpointer       user_data)
 {
-  UnmountWithOpData *data = user_data;
+  GTask *task = G_TASK (user_data);
+  UnmountWithOpData *data;
+
+  data = g_task_get_task_data (task);
 
   /* Do nothing if we've handled this already */
   if (data->completed)
@@ -859,21 +878,25 @@ on_show_processes_reply (GMountSource  *mount_source,
                                                     &data->aborted,
                                                     &data->choice);
 
-  complete_unmount_with_op (data, FALSE);
+  complete_unmount_with_op (task, FALSE);
 }
 
 static gboolean
 on_update_processes_timeout (gpointer user_data)
 {
-  UnmountWithOpData *data = user_data;
+  GTask *task = G_TASK (user_data);
+  UnmountWithOpData *data;
   GArray *processes;
-  GVfsDaemon *daemon = g_vfs_backend_get_daemon (data->backend);
+  GVfsDaemon *daemon;
+
+  data = g_task_get_task_data (task);
+  daemon = g_vfs_backend_get_daemon (G_VFS_BACKEND (g_task_get_source_object (task)));
 
   if (!g_vfs_daemon_has_blocking_processes (daemon))
     {
       /* no more processes, abort mount op */
       g_mount_source_abort (data->mount_source);
-      complete_unmount_with_op (data, TRUE);
+      complete_unmount_with_op (task, TRUE);
     }
   else
     {
@@ -883,7 +906,7 @@ on_update_processes_timeout (gpointer user_data)
                                            processes,
                                            data->choices,
                                            (GAsyncReadyCallback) on_show_processes_reply,
-                                           data);
+                                           task);
       g_array_unref (processes);
     }
 
@@ -921,19 +944,9 @@ g_vfs_backend_unmount_with_operation_finish (GVfsBackend *backend,
                                              GAsyncResult *res,
                                              GError **error)
 {
-  gboolean ret;
-  GSimpleAsyncResult *simple = G_SIMPLE_ASYNC_RESULT (res);
+  g_return_val_if_fail (g_task_is_valid (res, backend), FALSE);
 
-  if (g_simple_async_result_propagate_error (simple, error))
-    {
-      ret = FALSE;
-    }
-  else
-    {
-      ret = g_simple_async_result_get_op_res_gboolean (simple);
-    }
-
-  return ret;
+  return g_task_propagate_boolean (G_TASK (res), error);
 }
 
 /**
@@ -963,6 +976,7 @@ g_vfs_backend_unmount_with_operation (GVfsBackend        *backend,
                                       gpointer            user_data)
 {
   GArray *processes;
+  GTask *task;
   UnmountWithOpData *data;
   GVfsDaemon *daemon = g_vfs_backend_get_daemon (backend);
 
@@ -970,25 +984,18 @@ g_vfs_backend_unmount_with_operation (GVfsBackend        *backend,
   g_return_if_fail (G_IS_MOUNT_SOURCE (mount_source));
   g_return_if_fail (callback != NULL);
 
+  task = g_task_new (backend, NULL, callback, user_data);
+
   /* if no processes are blocking, complete immediately */
   if (!g_vfs_daemon_has_blocking_processes (daemon))
     {
-      GSimpleAsyncResult *simple;
-      simple = g_simple_async_result_new (G_OBJECT (backend),
-                                          callback,
-                                          user_data,
-                                          NULL);
-      g_simple_async_result_set_op_res_gboolean (simple, TRUE);
-      g_simple_async_result_complete (simple);
-      g_object_unref (simple);
+      g_task_return_boolean (task, TRUE);
+      g_object_unref (task);
       return;
     }
 
   data = g_new0 (UnmountWithOpData, 1);
-  data->backend = backend;
   data->mount_source = mount_source;
-  data->callback = callback;
-  data->user_data = user_data;
 
   data->choices[0] = _("Unmount Anyway");
   data->choices[1] = _("Cancel");
@@ -996,11 +1003,7 @@ g_vfs_backend_unmount_with_operation (GVfsBackend        *backend,
   data->message = _("Volume is busy\n"
                     "One or more applications are keeping the volume busy.");
 
-  /* free data when the mount source goes away */
-  g_object_set_data_full (G_OBJECT (mount_source),
-                          "unmount-op-data",
-                          data,
-                          (GDestroyNotify) unmount_with_op_data_free);
+  g_task_set_task_data (task, data, (GDestroyNotify)unmount_with_op_data_free);
 
   /* show processes */
   processes = g_vfs_daemon_get_blocking_processes (daemon);
@@ -1009,13 +1012,13 @@ g_vfs_backend_unmount_with_operation (GVfsBackend        *backend,
                                        processes,
                                        data->choices,
                                        (GAsyncReadyCallback) on_show_processes_reply,
-                                       data);
+                                       task);
   g_array_unref (processes);
 
   /* update these processes every two secs */
   data->timeout_id = g_timeout_add_seconds (2,
                                             on_update_processes_timeout,
-                                            data);
+                                            task);
 }
 
 static void
@@ -1056,4 +1059,3 @@ g_vfs_backend_force_unmount (GVfsBackend *backend)
 				  (GAsyncReadyCallback) forced_unregister_mount_callback,
 				  backend);
 }
-
